@@ -4,7 +4,7 @@ set -Eeuo pipefail
 CERTS_DIR="/opt/hysteria/certs"
 PROFILE_FILE="/opt/hysteria/hysteria2-remnawave-profile.json"
 COMPOSE_DEFAULT="/opt/remnanode/docker-compose.yml"
-SERVICE="remnanode"
+SERVICE=""
 
 log(){ echo -e "\033[1;32m[+]\033[0m $*"; }
 warn(){ echo -e "\033[1;33m[!]\033[0m $*"; }
@@ -41,10 +41,45 @@ COMPOSE_PATH="${COMPOSE_PATH:-$COMPOSE_DEFAULT}"
 COMPOSE_PATH="$(readlink -f "$COMPOSE_PATH")"
 
 [[ -f "$COMPOSE_PATH" ]] || { err "$COMPOSE_PATH не найден."; exit 1; }
-docker compose -f "$COMPOSE_PATH" config --services | grep -qx "$SERVICE" || {
-  err "В compose нет сервиса remnanode."
+
+# Автоопределение имени docker compose сервиса Remnawave Node.
+mapfile -t COMPOSE_SERVICES < <(docker compose -f "$COMPOSE_PATH" config --services)
+
+for candidate in remnanode node remnawave-node remnawave_node; do
+  if printf '%s\n' "${COMPOSE_SERVICES[@]}" | grep -qx "$candidate"; then
+    SERVICE="$candidate"
+    break
+  fi
+done
+
+# Если имя нестандартное — ищем сервис по запущенному контейнеру и image remnawave/node.
+if [[ -z "$SERVICE" ]]; then
+  for svc in "${COMPOSE_SERVICES[@]}"; do
+    CID="$(docker compose -f "$COMPOSE_PATH" ps -q "$svc" 2>/dev/null || true)"
+    [[ -n "$CID" ]] || continue
+    IMAGE="$(docker inspect -f '{{.Config.Image}}' "$CID" 2>/dev/null || true)"
+    CNAME="$(docker inspect -f '{{.Name}}' "$CID" 2>/dev/null | sed 's#^/##' || true)"
+    if [[ "$IMAGE" == remnawave/node* || "$CNAME" == *remnanode* ]]; then
+      SERVICE="$svc"
+      break
+    fi
+  done
+fi
+
+# Если compose содержит ровно один сервис, считаем его Node-сервисом.
+if [[ -z "$SERVICE" && ${#COMPOSE_SERVICES[@]} -eq 1 ]]; then
+  SERVICE="${COMPOSE_SERVICES[0]}"
+fi
+
+if [[ -z "$SERVICE" ]]; then
+  err "Не удалось автоматически определить сервис Remnawave Node."
+  echo "Сервисы в compose: ${COMPOSE_SERVICES[*]}"
+  echo "Контейнеры compose:"
+  docker compose -f "$COMPOSE_PATH" ps || true
   exit 1
-}
+fi
+
+log "Определён Docker Compose сервис Node: $SERVICE"
 
 SERVER_IP="$(curl -4fsS --max-time 8 https://api.ipify.org || true)"
 [[ -n "$SERVER_IP" ]] || SERVER_IP="$(curl -4fsS --max-time 8 https://ifconfig.me || true)"
@@ -138,12 +173,13 @@ fi
 BACKUP="${COMPOSE_PATH}.bak-hysteria-$(date +%Y%m%d-%H%M%S)"
 cp -a "$COMPOSE_PATH" "$BACKUP"
 
-python3 - "$COMPOSE_PATH" "$CERTS_DIR:$CERTS_DIR:ro" <<'PY'
+python3 - "$COMPOSE_PATH" "$CERTS_DIR:$CERTS_DIR:ro" "$SERVICE" <<'PY'
 import re, sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
 mount = sys.argv[2]
+service = sys.argv[3]
 lines = path.read_text().splitlines(True)
 
 services_i = None
@@ -157,6 +193,8 @@ if services_i is None:
 base_indent = len(lines[services_i]) - len(lines[services_i].lstrip(' '))
 service_i = None
 service_indent = None
+pattern = r'^\s*' + re.escape(service) + r':\s*(?:#.*)?$'
+
 for i in range(services_i + 1, len(lines)):
     raw = lines[i].rstrip('\n')
     if not raw.strip() or raw.lstrip().startswith('#'):
@@ -164,12 +202,12 @@ for i in range(services_i + 1, len(lines)):
     indent = len(raw) - len(raw.lstrip(' '))
     if indent <= base_indent:
         break
-    if re.match(r'^\s*remnanode:\s*(?:#.*)?$', raw):
+    if re.match(pattern, raw):
         service_i = i
         service_indent = indent
         break
 if service_i is None:
-    raise SystemExit("remnanode service not found")
+    raise SystemExit(f"service {service!r} not found")
 
 end_i = len(lines)
 for i in range(service_i + 1, len(lines)):
@@ -184,7 +222,7 @@ for i in range(service_i + 1, len(lines)):
 block = ''.join(lines[service_i:end_i])
 certs_dir = mount.split(':', 1)[0]
 if certs_dir in block:
-    print("certificate mount already exists in remnanode")
+    print(f"certificate mount already exists in {service}")
     raise SystemExit(0)
 
 volumes_i = None
@@ -202,7 +240,7 @@ else:
     lines.insert(end_i, ' ' * (service_indent + 2) + "volumes:\n" + ' ' * (service_indent + 4) + f"- '{mount}'\n")
 
 path.write_text(''.join(lines))
-print("certificate mount added to remnanode only")
+print(f"certificate mount added to {service}")
 PY
 
 if ! docker compose -f "$COMPOSE_PATH" config >/dev/null; then
@@ -253,15 +291,15 @@ JSON
 
 python3 -m json.tool "$PROFILE_FILE" >/dev/null
 
-log "Пересоздаю remnanode..."
+log "Пересоздаю сервис Node: $SERVICE"
 docker compose -f "$COMPOSE_PATH" up -d --force-recreate "$SERVICE"
 sleep 5
 
 CID="$(docker compose -f "$COMPOSE_PATH" ps -q "$SERVICE")"
-[[ -n "$CID" ]] || { err "Контейнер remnanode не найден после recreate."; exit 1; }
+[[ -n "$CID" ]] || { err "Контейнер Node не найден после recreate."; exit 1; }
 
 docker inspect "$CID" --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx "$CERTS_DIR" || {
-  err "Volume $CERTS_DIR не появился внутри remnanode."
+  err "Volume $CERTS_DIR не появился внутри Node-контейнера."
   exit 1
 }
 
@@ -272,12 +310,13 @@ echo
 log "========== ГОТОВО =========="
 echo "Домен:             $DOMAIN"
 echo "IPv4:              $SERVER_IP"
+echo "Compose service:   $SERVICE"
 echo "Сертификаты:       $CERTS_DIR"
 echo "Профиль Remnawave: $PROFILE_FILE"
 echo "Compose backup:    $BACKUP"
 echo
 log "Node API:"
-ss -lntp | grep -E ':2222\b' || warn "TCP/2222 не найден — проверь логи remnanode."
+ss -lntp | grep -E ':2222\b' || warn "TCP/2222 не найден — проверь логи Node-контейнера."
 echo
 log "После привязки профиля в панели проверь:"
 echo "ss -lunp | grep ':443'"
