@@ -18,6 +18,8 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+# ---------- 1. Ввод параметров ----------
+
 read -rp "Домен для этой ноды (например node1.example.com): " DOMAIN
 if [[ -z "$DOMAIN" ]]; then
   err "Домен обязателен."
@@ -51,6 +53,8 @@ if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
   exit 0
 fi
 
+# ---------- 2. Проверка DNS ----------
+
 log "Проверяю DNS-запись для $DOMAIN..."
 RESOLVED_IP=$(getent hosts "$DOMAIN" | awk '{print $1}' | head -n1 || true)
 SERVER_IP=$(curl -s -4 --max-time 5 https://ifconfig.me || curl -s -4 --max-time 5 https://icanhazip.com || true)
@@ -71,14 +75,18 @@ else
   log "DNS ок: $DOMAIN -> $RESOLVED_IP"
 fi
 
+# ---------- 3. UFW: открыть нужные порты ----------
+
 if command -v ufw >/dev/null 2>&1; then
   log "Настраиваю UFW..."
-  ufw allow 80/tcp comment 'ACME challenge (certbot)' || true
-  ufw allow 443/udp comment 'Hysteria2' || true
+  ufw allow 80/tcp   comment 'ACME challenge (certbot)' || true
+  ufw allow 443/udp  comment 'Hysteria2' || true
   ufw status | grep -q "80/tcp" && log "80/tcp открыт" || warn "Не удалось подтвердить правило 80/tcp"
 else
   warn "UFW не найден — пропускаю настройку файрвола. Убедись, что 80/tcp и 443/udp открыты вручную (в т.ч. в облачном firewall провайдера)."
 fi
+
+# ---------- 4. certbot ----------
 
 if ! command -v certbot >/dev/null 2>&1; then
   log "Устанавливаю certbot..."
@@ -133,7 +141,9 @@ fi
 
 log "Копирую сертификат в $CERTS_DIR..."
 cp "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "$CERTS_DIR/fullchain.pem"
-cp "/etc/letsencrypt/live/$DOMAIN/privkey.pem" "$CERTS_DIR/privkey.pem"
+cp "/etc/letsencrypt/live/$DOMAIN/privkey.pem"  "$CERTS_DIR/privkey.pem"
+
+# ---------- 5. deploy-hook для авто-продления ----------
 
 log "Настраиваю авто-продление сертификата..."
 mkdir -p /etc/letsencrypt/renewal-hooks/deploy
@@ -142,11 +152,13 @@ HOOK_FILE="/etc/letsencrypt/renewal-hooks/deploy/hysteria-copy-${DOMAIN}.sh"
 cat > "$HOOK_FILE" <<EOF
 #!/bin/bash
 cp /etc/letsencrypt/live/${DOMAIN}/fullchain.pem ${CERTS_DIR}/fullchain.pem
-cp /etc/letsencrypt/live/${DOMAIN}/privkey.pem ${CERTS_DIR}/privkey.pem
+cp /etc/letsencrypt/live/${DOMAIN}/privkey.pem  ${CERTS_DIR}/privkey.pem
 docker compose -f ${COMPOSE_PATH} restart remnanode
 EOF
 chmod +x "$HOOK_FILE"
 log "Deploy-hook создан: $HOOK_FILE"
+
+# ---------- 6. BBR ----------
 
 log "Проверяю BBR..."
 if sysctl net.ipv4.tcp_available_congestion_control | grep -qw bbr; then
@@ -166,6 +178,8 @@ else
   log "BBR включён."
 fi
 
+# ---------- 7. docker-compose: volume для сертификатов ----------
+
 log "Проверяю volume в $COMPOSE_PATH..."
 if grep -q "$CERTS_DIR" "$COMPOSE_PATH"; then
   log "Volume для $CERTS_DIR уже прописан в compose-файле."
@@ -176,9 +190,11 @@ else
   python3 - "$COMPOSE_PATH" "$CERTS_DIR" <<'PYEOF'
 import re
 import sys
+
 compose_path, certs_dir = sys.argv[1], sys.argv[2]
 with open(compose_path) as f:
     lines = f.readlines()
+
 new_line_content = f"{certs_dir}:{certs_dir}:ro"
 inserted = False
 out = []
@@ -189,6 +205,7 @@ for line in lines:
         indent = match.group(1) + "  "
         out.append(f"{indent}- '{new_line_content}'\n")
         inserted = True
+
 if not inserted:
     print("WARN: не нашёл секцию volumes: в сервисе — добавь volume вручную:")
     print(f"      - '{new_line_content}'")
@@ -197,7 +214,10 @@ else:
         f.writelines(out)
     print(f"OK: volume {new_line_content} добавлен.")
 PYEOF
+
 fi
+
+# ---------- 8. Пересоздать контейнер ----------
 
 log "Пересоздаю контейнер remnanode (up -d, чтобы подхватить volume)..."
 docker compose -f "$COMPOSE_PATH" up -d
